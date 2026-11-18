@@ -34,6 +34,51 @@ the original `Host` header through the proxy so same-origin checks work.
 - Disk availability and archived video size, optional password protection, and health checks.
 - No CDN, external font requests, frontend build step, or hosted-service dependency.
 
+## GitHub Actions: publish to Google Container Registry
+
+The [Docker image workflow](.github/workflows/docker.yml) runs the integration tests
+and JavaScript syntax check inside Docker on pull requests to `main`, pushes to
+`main`, `v*` tags, and manual runs. After tests pass, pushes and manual runs on
+`main` or a `v*` tag publish the **production** image for `linux/amd64` and
+`linux/arm64` to `gcr.io/PROJECT_ID/yourchive`. Pull requests never authenticate or
+publish. Actions are pinned to commit SHAs, and BuildKit layers are cached.
+
+Tags are `main`, `latest` (default branch only), `v1.2.3` (when that Git tag is
+pushed), and `sha-<full-commit-sha>`. Release tags do not overwrite `latest`.
+
+Before the first publish:
+
+1. Configure an **Artifact Registry-backed `gcr.io` repository** in your Google
+   Cloud project. The legacy Container Registry no longer accepts pushes; follow
+   [Google's migration guide](https://docs.cloud.google.com/artifact-registry/docs/transition/auto-migrate-gcr-ar).
+2. Configure [GitHub Workload Identity Federation through a service account](https://github.com/google-github-actions/auth#workload-identity-federation-through-a-service-account).
+   Restrict the provider's trust condition to `smoqadam/yourchive` and the intended
+   publish refs (`refs/heads/main` and `refs/tags/v*`). Grant the matching identity
+   `roles/iam.workloadIdentityUser` on the service account, and grant that service
+   account `roles/artifactregistry.writer` on the target repository. Enable the
+   Artifact Registry, IAM Credentials, and Security Token Service APIs as required
+   by the linked setup instructions.
+3. Under **Settings → Secrets and variables → Actions → Variables**, add:
+
+   | Variable | Value |
+   | --- | --- |
+   | `GCP_PROJECT_ID` | Google Cloud project ID, such as `my-archive-project` |
+   | `GCP_WORKLOAD_IDENTITY_PROVIDER` | `projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL/providers/PROVIDER` |
+   | `GCP_SERVICE_ACCOUNT` | `github-publisher@PROJECT_ID.iam.gserviceaccount.com` |
+
+No service-account key or GitHub personal access token is required. The workflow
+exchanges GitHub's OIDC identity for a short-lived Google access token. Google
+Cloud resources and repository variables must be configured separately; adding
+the workflow does not create them.
+
+Once published, pull an image with:
+
+```sh
+docker pull gcr.io/PROJECT_ID/yourchive:latest
+```
+
+Private images require Google registry authentication on the deployment host.
+
 ## Docker development and tests
 
 All dependencies and development processes run inside Docker. Source and tests are
