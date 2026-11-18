@@ -20,6 +20,7 @@ jobs:
     name: Test in Docker
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -49,39 +50,23 @@ jobs:
         run: docker run --rm yourchive:test node --check app/static/app.js
 
   publish:
-    name: Publish to gcr.io
+    name: Publish to GitHub Container Registry
     needs: test
     if: >-
       github.event_name != 'pull_request' &&
       (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     timeout-minutes: 45
+
     permissions:
       contents: read
-      id-token: write
-    env:
-      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
-      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      packages: write
+
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - name: Check publishing configuration
-        shell: bash
-        run: |
-          for variable in GCP_PROJECT_ID GCP_WORKLOAD_IDENTITY_PROVIDER GCP_SERVICE_ACCOUNT; do
-            if [[ -z "${!variable}" ]]; then
-              echo "::error::Set the ${variable} repository variable. See README.md."
-              exit 1
-            fi
-          done
-          if [[ ! "$GCP_PROJECT_ID" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; then
-            echo '::error::GCP_PROJECT_ID must be a Google Cloud project ID, not its name or number.'
-            exit 1
-          fi
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
@@ -93,7 +78,7 @@ jobs:
         id: metadata
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: gcr.io/${{ vars.GCP_PROJECT_ID }}/yourchive
+          images: ghcr.io/${{ github.repository_owner }}/yourchive
           flavor: latest=false
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
@@ -101,24 +86,12 @@ jobs:
             type=ref,event=tag
             type=sha,format=long
 
-      - name: Authenticate to Google Cloud
-        id: auth
-        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
-        with:
-          project_id: ${{ vars.GCP_PROJECT_ID }}
-          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
-          token_format: access_token
-          access_token_lifetime: 3600s
-          create_credentials_file: false
-          export_environment_variables: false
-
-      - name: Log in to gcr.io
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
-          registry: gcr.io
-          username: oauth2accesstoken
-          password: ${{ steps.auth.outputs.access_token }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push production image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
