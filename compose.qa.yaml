@@ -1,0 +1,31 @@
+# Isolated browser test archive. Does not mount the real archive volumes.
+services:
+  qa:
+    build:
+      context: .
+      target: development
+    image: yourchive:dev
+    environment:
+      DATA_DIR: /data
+      MEDIA_DIR: /media
+      ARCHIVE_PASSWORD: ""
+    volumes:
+      - ./app:/app/app:ro
+      - ./tests:/app/tests:ro
+    tmpfs:
+      - /data:uid=1000,gid=1000
+      - /media:uid=1000,gid=1000
+    command: ["python", "-m", "tests.serve_fixture"]
+  browser:
+    image: mcr.microsoft.com/playwright:v1.51.1-noble
+    depends_on:
+      qa:
+        condition: service_healthy
+    working_dir: /app
+    environment:
+      NODE_PATH: /tmp/browser/node_modules
+      BASE_URL: http://qa:8000
+    volumes:
+      - ./tests/browser:/app/tests:ro
+      - ./artifacts:/app/artifacts
+    command: ["sh", "-c", "npm install --prefix /tmp/browser --no-save playwright@1.51.1 && node tests/smoke.cjs"]

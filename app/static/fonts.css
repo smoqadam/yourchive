@@ -1,0 +1,8 @@
+/* Bundled under SIL OFL; no third-party requests needed. */
+@font-face {
+  font-family: Manrope;
+  src: url("/fonts/Manrope.ttf") format("truetype");
+  font-style: normal;
+  font-weight: 200 800;
+  font-display: swap;
+}

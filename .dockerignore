@@ -1,0 +1,11 @@
+.git
+.venv
+__pycache__
+.pytest_cache
+.env
+media
+data
+tests
+node_modules
+*.png
+artifacts

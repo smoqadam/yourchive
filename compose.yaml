@@ -1,0 +1,30 @@
+services:
+  yourchive:
+    build: .
+    image: yourchive:local
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-8000}:8000"
+    environment:
+      ARCHIVE_PASSWORD: "${ARCHIVE_PASSWORD:-}"
+      DATA_DIR: /data
+      MEDIA_DIR: /media
+      # Optional: mount a writable Netscape cookie file and set this path.
+      # YTDLP_COOKIES_FILE: /cookies/youtube.txt
+    volumes:
+      - archive-data:/data
+      - archive-media:/media
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  archive-data:
+  archive-media:

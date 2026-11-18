@@ -1,0 +1,9 @@
+services:
+  yourchive:
+    build:
+      context: .
+      target: development
+    image: yourchive:dev
+    volumes:
+      - ./app:/app/app:ro
+      - ./tests:/app/tests:ro
