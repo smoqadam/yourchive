@@ -37,7 +37,7 @@ process_lock = threading.Lock()
 active_process: subprocess.Popen | None = None
 active_job_id: str | None = None
 DEFAULTS = {'quality': '1080', 'languages': 'en.*,en', 'auto_subtitles': True}
-JELLYFIN_DEFAULTS = {'enabled': False, 'url': '', 'api_key': '', 'media_path': '/media', 'last_sync': '', 'sync_state': 'Not configured', 'sync_error': ''}
+JELLYFIN_DEFAULTS = {'enabled': False, 'url': '', 'api_key': '', 'media_path': '/media', 'playlist_owner': '', 'last_sync': '', 'sync_state': 'Not configured', 'sync_error': ''}
 jellyfin_lock = threading.Lock()
 
 
@@ -141,15 +141,19 @@ def jellyfin_call(config, method, endpoint, body=None):
     url = base + endpoint
     data = json.dumps(body).encode() if body is not None else None
     request = urllib.request.Request(url, data=data, method=method, headers={
-        'X-Emby-Token': config['api_key'], 'Accept': 'application/json',
-        'Content-Type': 'application/json', 'X-Emby-Authorization': 'MediaBrowser Client="Yourchive", Device="Server", DeviceId="yourchive", Version="1.0"'})
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Authorization': f'MediaBrowser Client="Yourchive", Device="Server", DeviceId="yourchive", Version="1.0", Token="{config["api_key"]}"',
+    })
     try:
         with urllib.request.urlopen(request, timeout=12) as response:
             payload = response.read()
             return json.loads(payload) if payload else {}
     except urllib.error.HTTPError as exc:
         detail = exc.read(2048).decode(errors='replace')
-        raise RuntimeError(f'Jellyfin returned HTTP {exc.code}: {detail}') from exc
+        operation = f'{method} {endpoint.partition("?")[0]}'
+        message = f'Jellyfin returned HTTP {exc.code} for {operation}'
+        raise RuntimeError(f'{message}: {detail}' if detail else message) from exc
     except (urllib.error.URLError, TimeoutError) as exc:
         raise RuntimeError(f'Cannot reach Jellyfin: {exc}') from exc
 
@@ -223,8 +227,14 @@ def sync_jellyfin():
         for membership in playlists:
             groups.setdefault(membership['id'], {'title':membership['title'], 'jellyfin_id':membership['jellyfin_id'], 'entries':[]})['entries'].append((membership['video_id'], json.loads(membership['metadata']).get('playlist_index') or 0))
         synced_lists = 0
-        user = jellyfin_call(config, 'GET', '/Users/Me')
-        user_id = user['Id']
+        if groups:
+            users = jellyfin_call(config, 'GET', '/Users?IsDisabled=false')
+            owner = config.get('playlist_owner', '')
+            if owner:
+                users = [user for user in users if user['Name'].casefold() == owner.casefold()]
+            if len(users) != 1:
+                raise RuntimeError('Set the Jellyfin playlist owner to an enabled Jellyfin username in Settings')
+            user_id = users[0]['Id']
         for source_id, group in groups.items():
             entries = sorted(group['entries'], key=lambda entry: entry[1] or 2**31)
             ids = [video_items[video_id] for video_id, _ in entries if video_id in video_items]
@@ -584,6 +594,7 @@ def save_settings(payload: dict):
     url = str(jellyfin.get('url', '')).strip().rstrip('/')
     api_key = str(jellyfin.get('api_key', '')).strip()
     media_path = str(jellyfin.get('media_path', '/media')).strip()
+    playlist_owner = str(jellyfin.get('playlist_owner', '')).strip()
     if enabled:
         parsed = urlparse(url)
         if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
@@ -591,7 +602,7 @@ def save_settings(payload: dict):
         if not api_key or not media_path.startswith('/') or '..' in Path(media_path).parts:
             raise HTTPException(422, 'Enter an API key and an absolute shared media path')
     current = get_settings().get('jellyfin', JELLYFIN_DEFAULTS.copy())
-    current.update({'enabled':enabled, 'url':url, 'api_key':api_key, 'media_path':media_path})
+    current.update({'enabled':enabled, 'url':url, 'api_key':api_key, 'media_path':media_path, 'playlist_owner':playlist_owner})
     result = {**options.model_dump(), 'jellyfin':current}
     with db() as c:
         c.execute('UPDATE settings SET value=? WHERE id=1', (json.dumps(result),))
