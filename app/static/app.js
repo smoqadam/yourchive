@@ -355,7 +355,8 @@ async function renderSettings() {
     const s = await api("/settings");
     state.settings = s;
     if (state.view !== "settings") return;
-    content.innerHTML = `<form id="settings-form" class="settings-panel"><h3>Download preferences</h3><p>Defaults for new downloads. You can change these for each source you add.</p>${optionsFields(s)}<div class="settings-actions"><button type="submit" class="button primary">Save preferences</button></div><div class="settings-divider"></div><h3>Your data stays yours.</h3><p>Videos, subtitles, thumbnails, and metadata are stored on your server. Export your library catalog as JSON, or back up your Docker data and media volumes to keep everything safe.</p><a class="button secondary" href="/api/export" download>${icon("download")}Export library catalog</a><p class="help">The catalog export includes metadata and watch history. Media files are backed up separately.</p></form>`;
+    const jellyfin = s.jellyfin || {};
+    content.innerHTML = `<form id="settings-form" class="settings-panel"><h3>Download preferences</h3><p>Defaults for new downloads. You can change these for each source you add.</p>${optionsFields(s)}<div class="settings-divider"></div><h3>Jellyfin</h3><p>Share the archive media folder with Jellyfin, then Yourchive can create Jellyfin playlists and sync existing videos.</p><label class="check-label"><input type="checkbox" name="jellyfin_enabled" ${jellyfin.enabled ? "checked" : ""}>Enable Jellyfin sync</label><label for="jellyfin-url">Jellyfin URL</label><input id="jellyfin-url" name="jellyfin_url" type="url" placeholder="http://host.docker.internal:8096" value="${esc(jellyfin.url || "")}"><label for="jellyfin-key">Jellyfin API key</label><input id="jellyfin-key" name="jellyfin_api_key" type="password" autocomplete="new-password" value="${esc(jellyfin.api_key || "")}"><label for="jellyfin-media-path">Media path as seen by Jellyfin</label><input id="jellyfin-media-path" name="jellyfin_media_path" value="${esc(jellyfin.media_path || "/media")}" required><p class="help">Mount the same Docker media volume in Jellyfin at this exact path. Yourchive writes a .nfo metadata file beside each video.</p><div class="settings-actions"><button type="submit" class="button primary">Save preferences</button><button type="button" id="jellyfin-sync" class="button secondary" ${jellyfin.enabled ? "" : "disabled"}>Sync archive to Jellyfin</button></div><p id="jellyfin-status" class="help">${esc(jellyfin.sync_error || jellyfin.sync_state || "Not configured")}${jellyfin.last_sync ? ` · Last sync ${esc(jellyfin.last_sync)}` : ""}</p><div class="settings-divider"></div><h3>Your data stays yours.</h3><p>Videos, subtitles, thumbnails, and metadata are stored on your server. Export your library catalog as JSON, or back up your Docker data and media volumes to keep everything safe.</p><a class="button secondary" href="/api/export" download>${icon("download")}Export library catalog</a><p class="help">The catalog export includes metadata and watch history. Media files are backed up separately.</p></form>`;
     $("#settings-form").addEventListener("submit", async (e) => {
       e.preventDefault();
       const button = $("button[type=submit]", e.target);
@@ -363,13 +364,27 @@ async function renderSettings() {
       try {
         state.settings = await api("/settings", {
           method: "PUT",
-          body: JSON.stringify(readOptions(e.target)),
+          body: JSON.stringify({...readOptions(e.target), jellyfin: readJellyfin(e.target)}),
         });
+        $("#jellyfin-sync").disabled = !state.settings.jellyfin.enabled;
         toast("Preferences saved.");
       } catch (error) {
         toast(error.message);
       } finally {
         button.disabled = false;
+      }
+    });
+    $("#jellyfin-sync").addEventListener("click", async (e) => {
+      e.currentTarget.disabled = true;
+      $("#jellyfin-status").textContent = "Syncing archive and playlists…";
+      try {
+        const result = await api("/jellyfin/sync", {method:"POST"});
+        $("#jellyfin-status").textContent = result.message;
+        toast(result.message);
+      } catch (error) {
+        $("#jellyfin-status").textContent = error.message;
+      } finally {
+        e.currentTarget.disabled = !$("[name=jellyfin_enabled]").checked;
       }
     });
   } catch (e) {
@@ -388,6 +403,14 @@ function readOptions(form) {
     quality: form.elements.quality.value,
     languages: form.elements.languages.value.trim(),
     auto_subtitles: form.elements.auto_subtitles.checked,
+  };
+}
+function readJellyfin(form) {
+  return {
+    enabled: form.elements.jellyfin_enabled.checked,
+    url: form.elements.jellyfin_url.value.trim(),
+    api_key: form.elements.jellyfin_api_key.value.trim(),
+    media_path: form.elements.jellyfin_media_path.value.trim(),
   };
 }
 async function openAdd() {

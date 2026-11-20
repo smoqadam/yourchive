@@ -14,6 +14,10 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager, contextmanager
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -33,6 +37,8 @@ process_lock = threading.Lock()
 active_process: subprocess.Popen | None = None
 active_job_id: str | None = None
 DEFAULTS = {'quality': '1080', 'languages': 'en.*,en', 'auto_subtitles': True}
+JELLYFIN_DEFAULTS = {'enabled': False, 'url': '', 'api_key': '', 'media_path': '/media', 'last_sync': '', 'sync_state': 'Not configured', 'sync_error': ''}
+jellyfin_lock = threading.Lock()
 
 
 @contextmanager
@@ -74,6 +80,13 @@ def initialize():
         c.execute('INSERT OR IGNORE INTO settings VALUES (1, ?)', (json.dumps(DEFAULTS),))
         c.execute("UPDATE jobs SET status='cancelled', detail='Cancelled before restart' WHERE status='running' AND cancel_requested=1")
         c.execute("UPDATE jobs SET status='queued', detail='Resuming after restart', cancel_requested=0 WHERE status='running'")
+        if 'jellyfin_id' not in [r['name'] for r in c.execute('PRAGMA table_info(playlists)')]:
+            c.execute('ALTER TABLE playlists ADD COLUMN jellyfin_id TEXT')
+        settings = json.loads(c.execute('SELECT value FROM settings WHERE id=1').fetchone()[0])
+        settings.setdefault('jellyfin', JELLYFIN_DEFAULTS.copy())
+        for key, value in JELLYFIN_DEFAULTS.items():
+            settings['jellyfin'].setdefault(key, value)
+        c.execute('UPDATE settings SET value=? WHERE id=1', (json.dumps(settings),))
 
 
 class Options(BaseModel):
@@ -123,6 +136,123 @@ def get_settings():
         return json.loads(c.execute('SELECT value FROM settings WHERE id=1').fetchone()[0])
 
 
+def jellyfin_call(config, method, endpoint, body=None):
+    base = config['url'].rstrip('/')
+    url = base + endpoint
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(url, data=data, method=method, headers={
+        'X-Emby-Token': config['api_key'], 'Accept': 'application/json',
+        'Content-Type': 'application/json', 'X-Emby-Authorization': 'MediaBrowser Client="Yourchive", Device="Server", DeviceId="yourchive", Version="1.0"'})
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            payload = response.read()
+            return json.loads(payload) if payload else {}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(2048).decode(errors='replace')
+        raise RuntimeError(f'Jellyfin returned HTTP {exc.code}: {detail}') from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise RuntimeError(f'Cannot reach Jellyfin: {exc}') from exc
+
+
+def write_jellyfin_metadata(video):
+    filepath = safe_media(video['filepath'])
+    root = ET.Element('movie')
+    ET.SubElement(root, 'title').text = video['title']
+    ET.SubElement(root, 'originaltitle').text = video['title']
+    ET.SubElement(root, 'plot').text = video.get('description') or ''
+    ET.SubElement(root, 'studio').text = video.get('channel') or 'YouTube'
+    ET.SubElement(root, 'uniqueid', {'type': 'youtube', 'default': 'true'}).text = video['id']
+    if video.get('upload_date'):
+        date = video['upload_date']
+        if re.fullmatch(r'\d{8}', date):
+            date = f'{date[:4]}-{date[4:6]}-{date[6:]}'
+        ET.SubElement(root, 'premiered').text = date
+        if len(date) >= 4 and date[:4].isdigit():
+            ET.SubElement(root, 'year').text = date[:4]
+    if video.get('duration'):
+        ET.SubElement(root, 'runtime').text = str(round(video['duration'] / 60))
+    ET.SubElement(root, 'tag').text = 'YouTube'
+    ET.indent(root)
+    target = filepath.with_suffix('.nfo')
+    target.write_bytes(ET.tostring(root, encoding='utf-8', xml_declaration=True))
+    return target
+
+
+def sync_jellyfin():
+    config = get_settings().get('jellyfin', {})
+    if not config.get('enabled'):
+        return {'synced': 0, 'playlists': 0, 'message': 'Jellyfin sync is disabled'}
+    if not all(config.get(k) for k in ('url', 'api_key', 'media_path')):
+        raise RuntimeError('Set the Jellyfin URL, API key, and shared media path first')
+    if not jellyfin_lock.acquire(blocking=False):
+        return {'synced': 0, 'playlists': 0, 'message': 'A Jellyfin sync is already running'}
+    try:
+        with db() as c:
+            videos = [dict(r) for r in c.execute('SELECT * FROM videos ORDER BY added_at')]
+            playlists = [dict(r) for r in c.execute('SELECT p.id,p.title,p.jellyfin_id,pv.video_id,v.metadata FROM playlists p JOIN playlist_videos pv ON pv.playlist_id=p.id JOIN videos v ON v.id=pv.video_id ORDER BY p.title')]
+        for video in videos:
+            write_jellyfin_metadata(video)
+        # Resolve the archive's already-indexed files to Jellyfin item IDs.
+        jellyfin_call(config, 'POST', '/Library/Refresh')
+        expected_paths = {os.path.normpath(str(Path(config['media_path']) / v['filepath'])) for v in videos}
+        items_by_path = {}
+        deadline = time.monotonic() + 30
+        while True:
+            items_by_path = {}
+            start = 0
+            while True:
+                page = jellyfin_call(config, 'GET', f'/Items?Recursive=true&Fields=Path&StartIndex={start}&Limit=1000')
+                items = page.get('Items', [])
+                for item in items:
+                    if item.get('Path'):
+                        items_by_path[os.path.normpath(item['Path'])] = item['Id']
+                start += len(items)
+                if not items or start >= page.get('TotalRecordCount', 0):
+                    break
+            if expected_paths.issubset(items_by_path) or time.monotonic() >= deadline:
+                break
+            time.sleep(1)
+        media_root = Path(config['media_path'])
+        video_items = {}
+        for video in videos:
+            expected = os.path.normpath(str(media_root / video['filepath']))
+            if expected in items_by_path:
+                video_items[video['id']] = items_by_path[expected]
+        # Keep Jellyfin playlists owned by Yourchive in sync, preserving order.
+        groups = {}
+        for membership in playlists:
+            groups.setdefault(membership['id'], {'title':membership['title'], 'jellyfin_id':membership['jellyfin_id'], 'entries':[]})['entries'].append((membership['video_id'], json.loads(membership['metadata']).get('playlist_index') or 0))
+        synced_lists = 0
+        user = jellyfin_call(config, 'GET', '/Users/Me')
+        user_id = user['Id']
+        for source_id, group in groups.items():
+            entries = sorted(group['entries'], key=lambda entry: entry[1] or 2**31)
+            ids = [video_items[video_id] for video_id, _ in entries if video_id in video_items]
+            playlist_id = group['jellyfin_id']
+            if not playlist_id:
+                params = {'Name':f"YouTube · {group['title']}", 'MediaType':'Video', 'UserId':user_id}
+                if ids:
+                    params['Ids'] = ','.join(ids)
+                query = urllib.parse.urlencode(params)
+                created = jellyfin_call(config, 'POST', '/Playlists?' + query)
+                playlist_id = created.get('Id') or created.get('PlaylistId')
+                if not playlist_id:
+                    raise RuntimeError(f"Jellyfin did not return an ID for playlist {group['title']}")
+                with db() as c:
+                    c.execute('UPDATE playlists SET jellyfin_id=? WHERE id=?', (playlist_id, source_id))
+            elif ids:
+                existing = jellyfin_call(config, 'GET', f'/Playlists/{playlist_id}/Items?UserId={urllib.parse.quote(user_id)}')
+                existing_ids = {item['Id'] for item in existing.get('Items', [])}
+                new_ids = [item_id for item_id in ids if item_id not in existing_ids]
+                if new_ids:
+                    query = urllib.parse.urlencode({'Ids':','.join(new_ids), 'UserId':user_id})
+                    jellyfin_call(config, 'POST', f'/Playlists/{playlist_id}/Items?' + query)
+            synced_lists += 1
+        return {'synced':len(video_items), 'playlists':synced_lists, 'message':f"Synced {len(video_items)} videos and {synced_lists} playlists"}
+    finally:
+        jellyfin_lock.release()
+
+
 def job_update(job_id, **values):
     values['updated_at'] = time.time()
     with db() as c:
@@ -167,6 +297,9 @@ def import_video(path: Path, context: dict | None = None):
             c.execute('INSERT INTO playlists VALUES (?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title',
                       (info['playlist_id'], info.get('playlist_title') or info.get('playlist') or info['playlist_id']))
             c.execute('INSERT OR IGNORE INTO playlist_videos VALUES (?,?)', (info['playlist_id'], video_id))
+    write_jellyfin_metadata({'id':video_id, 'title':info.get('title') or video_id,
+        'description':info.get('description', ''), 'channel':info.get('channel') or info.get('uploader') or 'Unknown channel',
+        'duration':info.get('duration'), 'upload_date':info.get('upload_date'), 'filepath':str(path.relative_to(MEDIA))})
     return True
 
 
@@ -248,6 +381,13 @@ def run_job(job):
             job_update(job['id'], status='failed', error='\n'.join(errors[-5:]) or f'Downloader exited with code {code}', detail=f'{completed} video(s) archived before errors')
         else:
             job_update(job['id'], status='completed', progress=100, detail=f'{completed} video(s) archived')
+            if completed and get_settings().get('jellyfin', {}).get('enabled'):
+                try:
+                    result = sync_jellyfin()
+                    job_update(job['id'], detail=f"{completed} video(s) archived · {result['message']}")
+                except Exception as sync_error:
+                    log.exception('Jellyfin sync failed')
+                    job_update(job['id'], detail=f'{completed} video(s) archived · Jellyfin sync failed', error=str(sync_error)[:2000])
     except Exception as exc:
         log.exception('Download failed')
         job_update(job['id'], status='failed', error=str(exc)[:2000])
@@ -434,10 +574,45 @@ def settings():
 
 
 @app.put('/api/settings')
-def save_settings(options: Options):
+def save_settings(payload: dict):
+    options = Options.model_validate(payload)
+    jellyfin = payload.get('jellyfin', {})
+    enabled = bool(jellyfin.get('enabled', False))
+    url = str(jellyfin.get('url', '')).strip().rstrip('/')
+    api_key = str(jellyfin.get('api_key', '')).strip()
+    media_path = str(jellyfin.get('media_path', '/media')).strip()
+    if enabled:
+        parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise HTTPException(422, 'Enter a valid Jellyfin server URL')
+        if not api_key or not media_path.startswith('/') or '..' in Path(media_path).parts:
+            raise HTTPException(422, 'Enter an API key and an absolute shared media path')
+    current = get_settings().get('jellyfin', JELLYFIN_DEFAULTS.copy())
+    current.update({'enabled':enabled, 'url':url, 'api_key':api_key, 'media_path':media_path})
+    result = {**options.model_dump(), 'jellyfin':current}
     with db() as c:
-        c.execute('UPDATE settings SET value=? WHERE id=1', (options.model_dump_json(),))
-    return options
+        c.execute('UPDATE settings SET value=? WHERE id=1', (json.dumps(result),))
+    return result
+
+
+@app.post('/api/jellyfin/sync')
+def jellyfin_sync():
+    config = get_settings().get('jellyfin', {})
+    if not config.get('enabled'):
+        raise HTTPException(409, 'Enable Jellyfin sync and save your connection first')
+    try:
+        result = sync_jellyfin()
+        with db() as c:
+            settings = json.loads(c.execute('SELECT value FROM settings WHERE id=1').fetchone()[0])
+            settings['jellyfin'].update({'last_sync':time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()), 'sync_state':result['message'], 'sync_error':''})
+            c.execute('UPDATE settings SET value=? WHERE id=1', (json.dumps(settings),))
+        return result
+    except Exception as exc:
+        with db() as c:
+            settings = json.loads(c.execute('SELECT value FROM settings WHERE id=1').fetchone()[0])
+            settings['jellyfin'].update({'sync_state':'Sync failed', 'sync_error':str(exc)[:500]})
+            c.execute('UPDATE settings SET value=? WHERE id=1', (json.dumps(settings),))
+        raise HTTPException(502, str(exc)) from exc
 
 
 @app.get('/api/export')
