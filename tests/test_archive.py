@@ -74,7 +74,8 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(detail['position'], 23)
         self.assertTrue(detail['favorite'])
         self.assertEqual(detail['subtitles'][0]['language'], 'en')
-        self.assertEqual(len(detail['files']), 4)
+        self.assertEqual(len(detail['files']), 5)
+        self.assertTrue(any(f['name'].endswith('.nfo') for f in detail['files']))
         self.assertEqual(self.client.patch('/api/videos/abc12345678',json={'position':-1}).status_code,422)
         exported = self.client.get('/api/export')
         self.assertIn('attachment', exported.headers['content-disposition'])
@@ -98,13 +99,17 @@ class ArchiveTests(unittest.TestCase):
 
     def test_settings_and_origin_protection(self):
         options = {'quality':'2160','languages':'en.*,en,de','auto_subtitles':False}
-        self.assertEqual(self.client.put('/api/settings',json=options).json(),options)
-        self.assertEqual(self.client.get('/api/settings').json(), options)
+        saved = self.client.put('/api/settings',json=options).json()
+        self.assertEqual({key:saved[key] for key in options}, options)
+        self.assertFalse(saved['jellyfin']['enabled'])
+        settings = self.client.get('/api/settings').json()
+        self.assertEqual({key:settings[key] for key in options}, options)
         self.assertEqual(self.client.put('/api/settings',json={**options,'quality':'100000'}).status_code,422)
         self.assertEqual(self.client.post('/api/jobs',json={'url':'https://youtu.be/abc'},headers={'Origin':'https://evil.test'}).status_code,403)
         job_id=self.job()
         with archive.db() as c:
-            self.assertEqual(json.loads(c.execute('SELECT options FROM jobs WHERE id=?',(job_id,)).fetchone()[0]),options)
+            saved_options=json.loads(c.execute('SELECT options FROM jobs WHERE id=?',(job_id,)).fetchone()[0])
+            self.assertEqual({key:saved_options[key] for key in options},options)
 
     def test_auth_protects_media_and_api(self):
         with patch.dict(os.environ, {'ARCHIVE_PASSWORD':'password'}):

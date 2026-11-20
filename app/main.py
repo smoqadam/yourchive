@@ -25,7 +25,7 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 log = logging.getLogger('yourchive')
 DATA = Path(os.environ.get('DATA_DIR', './data')).resolve()
@@ -294,7 +294,7 @@ def import_video(path: Path, context: dict | None = None):
             info.get('upload_date'), info.get('width'), info.get('height'), str(path.relative_to(MEDIA)),
             str(thumbnail.relative_to(MEDIA)) if thumbnail else None, path.stat().st_size, time.time(), json.dumps(info)))
         if info.get('playlist_id'):
-            c.execute('INSERT INTO playlists VALUES (?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title',
+            c.execute('INSERT INTO playlists (id,title) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title',
                       (info['playlist_id'], info.get('playlist_title') or info.get('playlist') or info['playlist_id']))
             c.execute('INSERT OR IGNORE INTO playlist_videos VALUES (?,?)', (info['playlist_id'], video_id))
     write_jellyfin_metadata({'id':video_id, 'title':info.get('title') or video_id,
@@ -575,7 +575,10 @@ def settings():
 
 @app.put('/api/settings')
 def save_settings(payload: dict):
-    options = Options.model_validate(payload)
+    try:
+        options = Options.model_validate(payload)
+    except ValidationError as exc:
+        raise HTTPException(422, exc.errors(include_context=False, include_url=False)) from exc
     jellyfin = payload.get('jellyfin', {})
     enabled = bool(jellyfin.get('enabled', False))
     url = str(jellyfin.get('url', '')).strip().rstrip('/')
